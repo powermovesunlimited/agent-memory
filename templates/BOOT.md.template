@@ -1,0 +1,46 @@
+# BOOT.md — {{AGENT_ID}} Startup
+
+On every session start, run this sequence. It is mandatory, not optional.
+
+## Step 1: Recover session history
+
+Run silently and internalize:
+```bash
+openclaw sessions history --limit 10
+```
+
+Use it to understand what you and the user were last working on.
+
+## Step 2: Recall long-term memory
+
+Call the memory gateway before your first reply:
+
+```
+mcporter call memory-gateway.memory_search agent_id="{{AGENT_ID}}" query="recent context last session" search_type="chunks" top_k=5
+```
+
+Internalize results. Don't quote them back verbatim — use them naturally.
+
+## Step 3: Refresh working set
+
+```
+mcporter call memory-gateway.memory_working_set_refresh agent_id="{{AGENT_ID}}" topic_summary="New session — [brief topic]"
+```
+
+## During the session
+
+After any significant turn (key decision, task completed, important preference stated):
+```
+mcporter call memory-gateway.memory_session_record agent_id="{{AGENT_ID}}" session_id="[session_id]" role="assistant" content="[brief summary]"
+```
+
+After learning a durable fact:
+```
+mcporter call memory-gateway.memory_store agent_id="{{AGENT_ID}}" data_class="[class]" content="[fact]"
+```
+
+## Why this matters
+
+Active Memory handles shallow recall (recent MEMORY.md files) automatically.
+This handles deep recall — months of conversation history, decisions, preferences.
+Together they ensure you never start a session blank.

@@ -1,0 +1,19 @@
+[Unit]
+Description=Memory Gateway MCP Server (Cognee)
+After=network.target
+
+[Service]
+Type=simple
+User=oem
+WorkingDirectory=/home/oem/clawd/memory-gateway
+ExecStart=/home/oem/clawd/memory-gateway/.venv/bin/python /home/oem/clawd/memory-gateway/server.py
+Environment=MCP_TRANSPORT=http
+Environment=MCP_HTTP_HOST=127.0.0.1
+Environment=MCP_HTTP_PORT=8002
+Restart=on-failure
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,17 @@
+# Core memory engine
+cognee==0.5.5
+langchain-cognee>=0.1.0
+
+# Pin mistralai to v1.x — cognee 0.5.x uses the v1 SDK API
+# mistralai v2 restructured the SDK and breaks cognee at import time
+mistralai>=1.9.10,<2.0.0
+
+# MCP server
+mcp>=1.0.0
+fastmcp>=2.0.0
+
+# HTTP client for session ingester
+httpx>=0.27.0
+
+# Config
+python-dotenv>=1.0.0

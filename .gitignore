@@ -1,0 +1,8 @@
+cognee-data/
+data/
+.env
+__pycache__/
+*.pyc
+.venv/
+logs/
+*.log
