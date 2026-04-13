@@ -165,10 +165,18 @@ AGENT_DATASETS = {}  # reserved for future static overrides
 _COGNEE_WRITE_LOCK = asyncio.Lock()
 
 # Skip cognify (graph construction) for high-frequency writes.
-# Graph building uses KuzuDB which has an exclusive file lock — concurrent writes fail.
-# Vector search via LanceDB works fine without cognify and is sufficient for agent recall.
-# Set COGNEE_SKIP_COGNIFY=true to disable graph construction (not recommended — breaks search).
 _SKIP_COGNIFY = os.getenv("COGNEE_SKIP_COGNIFY", "false").lower() != "false"
+
+# Data classes that are org-level and should be shared across all agents.
+# When memory_store is called with one of these, the fact is written to BOTH
+# the agent's private dataset AND the shared org dataset.
+ORG_LEVEL_DATA_CLASSES = frozenset({
+    "contact.identity",      # Who the user is
+    "contact.preferences",   # User preferences that all agents should know
+    "org.config",            # Workflow rules, agent assignments
+    "decision",              # Explicit decisions (mapped to org.config)
+    "reasoning.pattern",     # Cross-agent resolution patterns
+})
 
 SEARCH_TYPE_MAP = {
     "graph_completion": SearchType.GRAPH_COMPLETION,
@@ -345,20 +353,43 @@ async def memory_store(
 
     tagged_content = f"[agent:{agent_id}] [class:{data_class}] {content}"
 
+    # Dual-write: org-level facts go to both private dataset AND shared
+    is_org_level = data_class in ORG_LEVEL_DATA_CLASSES and target_dataset != DEFAULT_DATASET
+    datasets_to_write = [target_dataset]
+    if is_org_level:
+        datasets_to_write.append(DEFAULT_DATASET)
+        log.info(f"memory_store | org-level class '{data_class}' — dual-writing to shared dataset")
+
     try:
         async with _COGNEE_WRITE_LOCK:
             await cognee.add(tagged_content, dataset_name=target_dataset)
             if not _SKIP_COGNIFY:
                 await cognee.cognify(datasets=[target_dataset])
+
+        # Dual-write to shared: fire-and-forget background task so we don't block the caller
+        if is_org_level:
+            async def _shared_write():
+                async with _COGNEE_WRITE_LOCK:
+                    try:
+                        await cognee.add(tagged_content, dataset_name=DEFAULT_DATASET)
+                        if not _SKIP_COGNIFY:
+                            await cognee.cognify(datasets=[DEFAULT_DATASET])
+                        log.info(f"memory_store | shared dual-write complete for agent={agent_id} class={data_class}")
+                    except Exception as sw_err:
+                        log.warning(f"memory_store | shared dual-write failed: {sw_err}")
+            asyncio.create_task(_shared_write())
+
         elapsed = time.monotonic() - t0
 
         _audit_log(agent_id, "memory_store", {
             "data_class": data_class, "dataset": target_dataset,
+            "shared_write": is_org_level,
             "content_length": len(content), "elapsed_ms": round(elapsed * 1000),
         })
 
         return json.dumps({
             "status": "stored", "dataset": target_dataset, "data_class": data_class,
+            "shared_write": is_org_level,
             "content_length": len(content), "elapsed_ms": round(elapsed * 1000),
         }, default=str)
 
