@@ -288,16 +288,26 @@ async def memory_search(
         elapsed = time.monotonic() - t0
         formatted = _format_results(results)
 
+        # Extract relevance scores for observability
+        scores = [r.get("score") or r.get("feedback_weight") for r in formatted if r.get("score") or r.get("feedback_weight")]
+        avg_score = round(sum(float(s) for s in scores) / len(scores), 3) if scores else None
+        empty = len(formatted) == 0
+
         _audit_log(agent_id, "memory_search", {
             "query": query, "search_type": search_type,
             "datasets": datasets, "results_count": len(formatted),
             "elapsed_ms": round(elapsed * 1000),
+            "avg_relevance_score": avg_score,
+            "returned_empty": empty,
+            "top_result_preview": (formatted[0].get("text") or formatted[0].get("content", ""))[:100] if formatted else None,
         })
 
         return json.dumps({
             "results": formatted, "count": len(formatted),
             "search_type": search_type, "datasets": datasets,
             "elapsed_ms": round(elapsed * 1000),
+            "avg_relevance_score": avg_score,
+            "returned_empty": empty,
         }, default=str)
 
     except Exception as e:
@@ -474,9 +484,145 @@ async def memory_stats(agent_id: str = "default") -> str:
         return json.dumps({"status": "error", "error": str(e)})
 
 
-# ========================================================================
-# PHASE 1: Active Context Management
-# ========================================================================
+@mcp.tool()
+async def memory_metrics(
+    agent_id: str = "",
+    days: int = 7,
+) -> str:
+    """Get memory usage metrics and lookup quality stats.
+
+    Shows search quality (empty result rate, avg relevance), store success/fail,
+    sessions ingested, and per-agent breakdowns. Use this to monitor memory health.
+
+    Args:
+        agent_id: Filter to a specific agent (default: all agents)
+        days: Lookback window in days (default: 7)
+
+    Returns:
+        JSON with search quality, store stats, and per-agent breakdown.
+    """
+    try:
+        if not AUDIT_DB.exists():
+            return json.dumps({"error": "No audit data yet"})
+
+        conn = _get_audit_conn()
+        since = f"datetime('now', '-{days} days')"
+        where_agent = f" AND agent_id = '{agent_id}'" if agent_id else ""
+
+        # Search stats
+        search_rows = conn.execute(f"""
+            SELECT
+                COUNT(*) as total,
+                SUM(CASE WHEN json_extract(details, '$.returned_empty') = 1 THEN 1 ELSE 0 END) as empty_count,
+                AVG(json_extract(details, '$.elapsed_ms')) as avg_elapsed_ms,
+                AVG(json_extract(details, '$.results_count')) as avg_results,
+                AVG(json_extract(details, '$.avg_relevance_score')) as avg_relevance
+            FROM audit_log
+            WHERE operation = 'memory_search'
+            AND timestamp > {since}
+            {where_agent}
+        """).fetchone()
+
+        search_errors = conn.execute(f"""
+            SELECT COUNT(*) FROM audit_log
+            WHERE operation = 'memory_search_error'
+            AND timestamp > {since}
+            {where_agent}
+        """).fetchone()[0]
+
+        # Store stats
+        store_rows = conn.execute(f"""
+            SELECT
+                COUNT(*) as total,
+                AVG(json_extract(details, '$.elapsed_ms')) as avg_elapsed_ms
+            FROM audit_log
+            WHERE operation = 'memory_store'
+            AND timestamp > {since}
+            {where_agent}
+        """).fetchone()
+
+        store_errors = conn.execute(f"""
+            SELECT COUNT(*) FROM audit_log
+            WHERE operation = 'memory_store_error'
+            AND timestamp > {since}
+            {where_agent}
+        """).fetchone()[0]
+
+        # Per-agent breakdown
+        agent_rows = conn.execute(f"""
+            SELECT
+                agent_id,
+                SUM(CASE WHEN operation = 'memory_search' THEN 1 ELSE 0 END) as searches,
+                SUM(CASE WHEN operation = 'memory_search_error' THEN 1 ELSE 0 END) as search_errors,
+                SUM(CASE WHEN operation = 'memory_store' THEN 1 ELSE 0 END) as stores,
+                SUM(CASE WHEN operation = 'memory_store_error' THEN 1 ELSE 0 END) as store_errors,
+                SUM(CASE WHEN operation = 'memory_search' AND json_extract(details, '$.returned_empty') = 1 THEN 1 ELSE 0 END) as empty_searches,
+                MAX(timestamp) as last_activity
+            FROM audit_log
+            WHERE timestamp > {since}
+            {where_agent}
+            GROUP BY agent_id
+            ORDER BY searches DESC
+        """).fetchall()
+
+        conn.close()
+
+        # Recent empty searches (for alerting)
+        conn2 = _get_audit_conn()
+        empty_examples = conn2.execute(f"""
+            SELECT agent_id, json_extract(details, '$.query') as query, timestamp
+            FROM audit_log
+            WHERE operation = 'memory_search'
+            AND json_extract(details, '$.returned_empty') = 1
+            AND timestamp > datetime('now', '-1 days')
+            {where_agent}
+            ORDER BY timestamp DESC LIMIT 5
+        """).fetchall()
+        conn2.close()
+
+        result = {
+            "period_days": days,
+            "agent_filter": agent_id or "all",
+            "searches": {
+                "total": search_rows[0] or 0,
+                "errors": search_errors,
+                "empty_results": int(search_rows[1] or 0),
+                "empty_rate_pct": round((search_rows[1] or 0) / max(search_rows[0] or 1, 1) * 100, 1),
+                "avg_results_returned": round(search_rows[3] or 0, 1),
+                "avg_elapsed_ms": round(search_rows[2] or 0),
+                "avg_relevance_score": round(search_rows[4], 3) if search_rows[4] else None,
+            },
+            "stores": {
+                "total": store_rows[0] or 0,
+                "errors": store_errors,
+                "avg_elapsed_ms": round(store_rows[1] or 0),
+            },
+            "recent_empty_searches": [
+                {"agent": r[0], "query": r[1], "at": r[2][:19]}
+                for r in empty_examples
+            ],
+            "by_agent": [
+                {
+                    "agent": r[0],
+                    "searches": r[1],
+                    "search_errors": r[2],
+                    "stores": r[3],
+                    "store_errors": r[4],
+                    "empty_searches": r[5],
+                    "last_activity": r[6][:19] if r[6] else None,
+                }
+                for r in agent_rows
+                if r[0] not in ("default", "test", "smartsupport-test")
+            ],
+        }
+
+        return json.dumps(result, default=str)
+
+    except Exception as e:
+        log.error(f"memory_metrics error: {e}\n{traceback.format_exc()}")
+        return json.dumps({"error": str(e)})
+
+
 
 @mcp.tool()
 async def memory_working_set_refresh(
